@@ -208,7 +208,7 @@ class Adam_mini(torch.optim.Optimizer):
             key, role = self._get_qkv_layer_key(name)
             if key is None:
                 continue
-            layer_to_qkv.setdefault(key, {})[role] = group["params"]
+            layer_to_qkv.setdefault(key, {})[role] = group["params"][0]
         self._qkv_triples = [
             (d["q"], d["k"], d["v"])
             for d in layer_to_qkv.values()

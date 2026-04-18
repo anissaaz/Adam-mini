@@ -115,6 +115,11 @@ beta1 = 0.9
 beta2 = 0.95
 epsilon = 1e-8
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
+# Adam-mini default thresholds
+scalar_qkv = False
+scalar_mlp_proj_after_step = 0
+per_head_qk_after_step = 20
+per_head_v_after_step = int(1e18)
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
 warmup_iters = 2000 # how many steps to warm up for
@@ -201,16 +206,6 @@ print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
-    
-if wandb_log and master_process:
-    assert _wandb_available, "wandb_log=True but wandb is not installed; pip install wandb"
-    wandb.init(
-        project=wandb_project,
-        group=wandb_group or None,
-        name=wandb_run_name or None,
-        tags=wandb_tags or None,
-        config=config,
-    )
 
 torch.manual_seed(seed + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
@@ -331,7 +326,11 @@ elif algorithm == 'adam_mini':
         weight_decay=weight_decay,
         model_sharding=False,
         dim=n_embd,
-        n_heads=n_head
+        n_heads=n_head,
+        scalar_mlp_proj_after_step=scalar_mlp_proj_after_step,
+        per_head_qk_after_step=per_head_qk_after_step,
+        per_head_v_after_step=per_head_v_after_step,
+        scalar_qkv=scalar_qkv,
     )
     #optimizer.wv_names = {} # For experiments with relatively small total steps  (like the 8B and 13B experiments here, we only run for 10k steps), we apply a single lr for Value and find it performs a bit better. Please comment this line if your total steps is larger than 10k or 20k or more.
     #raise ValueError("algorithm not supported")
@@ -341,6 +340,16 @@ if init_from == 'resume':
 
 checkpoint = None # free up memory
 
+    
+if wandb_log and master_process:
+    assert _wandb_available, "wandb_log=True but wandb is not installed; pip install wandb"
+    wandb.init(
+        project=wandb_project,
+        group=wandb_group or None,
+        name=wandb_run_name or None,
+        tags=wandb_tags or None,
+        config=config,
+    )
 
 # wrap model into DDP container
 if ddp:
