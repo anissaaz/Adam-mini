@@ -37,6 +37,49 @@ import logger
 import io_utils
 import torch_optimizer as optim
 
+try:
+    import wandb
+    _wandb_available = True
+except ImportError:
+    _wandb_available = False
+
+import sys
+
+class Tee:
+    """Duplicate output to both stdout/err and file"""
+
+    def __init__(self, file, err=False):
+        self.file = open(file, "w")
+        self.err = err
+        if not err:
+            self.std = sys.stdout
+            sys.stdout = self
+        else:
+            self.std = sys.stderr
+            sys.stderr = self
+
+    def __del__(self):
+        if not self.err:
+            sys.stdout = self.std
+        else:
+            sys.stderr = self.std
+        self.file.close()
+
+    def write(self, data):
+        try:
+            self.file.write(data)
+        except OSError:
+            pass
+        try:
+            self.std.write(data)
+        except OSError:
+            pass
+
+    def flush(self):
+        try:
+            self.file.flush()
+        except OSError:
+            pass
 
 # ipdb.set_trace()
 
@@ -52,6 +95,7 @@ eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 init_from = 'scratch'
 load_iter = 0
+extra_save_iters = []  # additional iters at which to snapshot (e.g. early-training steps)
 # data
 dataset = 'openwebtext' 
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
@@ -88,18 +132,38 @@ dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported
 
 print('current dtype', dtype)
 
+wandb_log = False
+wandb_project = 'optimizer-scaling'
+wandb_group = ''
+wandb_run_name = ''
+wandb_tags = []
+
 
 save_dir = 'log_gpt2/'+comment
 
 
 # -----------------------------------------------------------------------------
-config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
+config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str, list))]
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
 
 os.makedirs(save_dir, exist_ok = True)
+
+# Stdout/stderr capture — only after save_dir is created.
+# In DDP, each rank gets its own file so we don't lose non-zero-rank errors
+# and don't clobber rank 0's log.
+if tee_stdout:
+    rank_for_log = int(os.environ.get('RANK', 0))
+    stamp = time.strftime('%Y%m%d_%H%M%S')
+    log_path_stdout = f'{save_dir}/train_{stamp}_rank{rank_for_log}.log'
+    log_path_stderr = f'{save_dir}/train_{stamp}_rank{rank_for_log}.err'
+    _stdout_tee = Tee(log_path_stdout, err=False)
+    _stderr_tee = Tee(log_path_stderr, err=True)
+    print(f"[tee] mirroring stdout -> {log_path_stdout}")
+    print(f"[tee] mirroring stderr -> {log_path_stderr}")
+
 writer = SummaryWriter(save_dir)
 
 
@@ -137,6 +201,17 @@ print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
+    
+if wandb_log and master_process:
+    assert _wandb_available, "wandb_log=True but wandb is not installed; pip install wandb"
+    wandb.init(
+        project=wandb_project,
+        group=wandb_group or None,
+        name=wandb_run_name or None,
+        tags=wandb_tags or None,
+        config=config,
+    )
+
 torch.manual_seed(seed + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
@@ -259,7 +334,7 @@ elif algorithm == 'adam_mini':
         n_heads=n_head
     )
     #optimizer.wv_names = {} # For experiments with relatively small total steps  (like the 8B and 13B experiments here, we only run for 10k steps), we apply a single lr for Value and find it performs a bit better. Please comment this line if your total steps is larger than 10k or 20k or more.
-    raise ValueError("algorithm not supported")
+    #raise ValueError("algorithm not supported")
 
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
@@ -327,12 +402,18 @@ def train():
         if iter_num % eval_interval == 0 and master_process:
             losses = estimate_loss()
             writer.add_scalar('valloss', losses['val'], iter_num)
-            logger_loss_val.append([iter_num,  losses['val']])
-            print(f"step {iter_num}:  val loss {losses['val']:.4f}")
+            logger_loss_val.append([iter_num, losses['val']])
+            print(f"step {iter_num}: val loss {losses['val']:.4f}")
+            if wandb_log:
+                wandb.log({
+                    'val/lm_loss':     losses['val'].item(),
+                    'train/tokens_seen': iter_num * tokens_per_iter,
+                }, step=iter_num)
 
-
-        if master_process and  iter_num > 0 and iter_num % ckpt_interval == 0 or iter_num  in [round(max_iters*0.01),round(max_iters*0.25), round(max_iters*0.5), round(max_iters*0.75), round(max_iters*1 -1)]:
- 
+        # Extra checkpoint at Pythia-style early iters plus anything else in extra_save_iters.
+        regular_ckpt = iter_num > 0 and iter_num % ckpt_interval == 0
+        extra_ckpt = iter_num in extra_save_iters
+        if master_process and (regular_ckpt or extra_ckpt):
             #save ckpt
             checkpoint = {
                 'model': raw_model.state_dict(),
@@ -361,12 +442,12 @@ def train():
         t_f_b_e = time.time() - t_f_b
 
         t_clip = time.time()
+        grad_norm = None
         if grad_clip != 0.0:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
         t_clip_e = time.time() - t_clip
-
 
         t_step = time.time()
         scaler.step(optimizer)
@@ -382,14 +463,45 @@ def train():
         t0 = t1
         if iter_num % log_interval == 0 and master_process:
             lossf = loss.item() * gradient_accumulation_steps
-            if local_iter_num >= 5: # let the training loop settle a bit
+            if local_iter_num >= 5:
                 mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
                 running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%, forward backward time {t_f_b_e}s, clipping time {t_clip_e}s, optimier step time {t_step_e}s")
 
+            # --- Pythia-aligned metrics ---
+            tokens_seen = iter_num * tokens_per_iter
+            global_batch = batch_size * gradient_accumulation_steps * ddp_world_size
+            samples_per_sec = global_batch / dt
+            # Approximate FLOPs/s/GPU: A100 bf16 peak is 312 TFLOPS; running_mfu is vs that.
+            flops_per_sec_per_gpu = running_mfu * 312e12 if running_mfu > 0 else 0.0
+            peak_mem_gb = torch.cuda.max_memory_allocated() / 1e9
+            torch.cuda.reset_peak_memory_stats()
+            grad_norm_val = grad_norm.item() if grad_norm is not None else float('nan')
+
+            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, "
+                  f"mfu {running_mfu*100:.2f}%, grad_norm {grad_norm_val:.3f}, "
+                  f"mem {peak_mem_gb:.2f}GB, "
+                  f"f/b {t_f_b_e:.3f}s, clip {t_clip_e:.3f}s, opt {t_step_e:.3f}s")
+
+            # Tensorboard (existing)
             writer.add_scalar('trainloss', lossf, iter_num)
             logger_loss_train.append([iter_num, lossf])
             logger_loss_time.append([iter_num, t_f_b_e, t_clip_e, t_step_e])
+
+            # Wandb (Pythia-aligned naming)
+            if wandb_log:
+                wandb.log({
+                    'train/lm_loss':               lossf,
+                    'train/learning_rate':         lr,
+                    'train/tokens_seen':           tokens_seen,
+                    'train/grad_norm':             grad_norm_val,
+                    'runtime/iteration_time':      dt,
+                    'runtime/samples_per_sec':     samples_per_sec,
+                    'runtime/flops_per_sec_per_gpu': flops_per_sec_per_gpu,
+                    'perf/mfu':                    running_mfu,
+                    'mem/peak_gpu_gb':             peak_mem_gb,
+                }, step=iter_num)
+            
+            
         iter_num += 1
         local_iter_num += 1
 
