@@ -317,7 +317,7 @@ scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # optimizer
 if algorithm == 'adamw':
-    optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+    optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), epsilon, device_type)
 elif algorithm == 'adam_mini':
     optimizer = Adam_mini(
         named_parameters=model.named_parameters(),
@@ -333,7 +333,10 @@ elif algorithm == 'adam_mini':
         scalar_qkv=scalar_qkv,
     )
     #optimizer.wv_names = {} # For experiments with relatively small total steps  (like the 8B and 13B experiments here, we only run for 10k steps), we apply a single lr for Value and find it performs a bit better. Please comment this line if your total steps is larger than 10k or 20k or more.
-    #raise ValueError("algorithm not supported")
+elif algorithm == 'soap':
+    
+else:
+    raise ValueError("algorithm not supported")
 
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])

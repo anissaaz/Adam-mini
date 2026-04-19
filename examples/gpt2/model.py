@@ -296,7 +296,7 @@ class GPT(nn.Module):
 
         return model
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, use_sgd = False):
+    def configure_optimizers(self, weight_decay, learning_rate, betas, eps, device_type, use_sgd = False):
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
         # filter out those that do not require grad
@@ -323,7 +323,7 @@ class GPT(nn.Module):
             optimizer = torch.optim.SGD(optim_groups, lr = learning_rate, momentum = 0.9)
         
         else: 
-            optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+            optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, eps=eps, **extra_args)
     
             print(f"using fused AdamW: {use_fused}")
 
