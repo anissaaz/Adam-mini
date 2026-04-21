@@ -5,11 +5,61 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
+import re
+import time
+
 from itertools import chain
 
 # Parts of the code are modifications of Pytorch's AdamW optimizer
 # Parts of the code are modifications of code from https://github.com/jiaweizzhao/GaLore/blob/master/galore_torch/galore_projector.py
 
+# Parameter-name patterns that get block-diagonal L preconditioner.
+# Add 'attn.wq' later to extend, 'mlp.c_fc|mlp.c_proj' for MLPs (needs different block size).
+HEAD_BLOCK_PATTERNS = [re.compile(r'attn\.wk')]
+
+def blockdiag_eigh(L, n_heads):
+    """Eigendecompose a block-diagonal matrix by extracting per-head blocks and processing them as a batched eigh.
+    
+    L: (d, d). Only the n_heads diagonal blocks of size (head_dim, head_dim) are used;
+    off-block entries are ignored (assumed already zero).
+    
+    Returns (Q, eigs):
+      Q:    (d, d) block-diagonal orthogonal matrix
+      eigs: (d,) concatenated eigenvalues, ordered ascending within each block
+    """
+    d = L.shape[0]
+    assert d % n_heads == 0, f"d={d} not divisible by n_heads={n_heads}"
+    head_dim = d // n_heads
+    
+    # Extract diagonal blocks into (n_heads, head_dim, head_dim) tensor
+    blocks = torch.zeros((n_heads, head_dim, head_dim), 
+                         dtype=L.dtype, device=L.device)
+    for i in range(n_heads):
+        s = slice(i * head_dim, (i + 1) * head_dim)
+        blocks[i] = L[s, s]
+    
+    # Symmetrize and ridge in a batched way
+    blocks = 0.5 * (blocks + blocks.transpose(-1, -2))
+    eye_b = torch.eye(head_dim, dtype=blocks.dtype, device=blocks.device).expand_as(blocks)
+    blocks = blocks + 1e-30 * eye_b
+    
+    # Batched eigh — single kernel launch
+    try:
+        eigs_batched, vecs_batched = torch.linalg.eigh(blocks)
+    except Exception:
+        eigs_batched, vecs_batched = torch.linalg.eigh(blocks.to(torch.float64))
+        eigs_batched = eigs_batched.to(L.dtype)
+        vecs_batched = vecs_batched.to(L.dtype)
+        
+    # Assemble back into (d, d) block-diagonal Q
+    Q = torch.zeros((d, d), dtype=L.dtype, device=L.device)
+    eigs = torch.zeros(d, dtype=L.dtype, device=L.device)
+    for i in range(n_heads):
+        s = slice(i * head_dim, (i + 1) * head_dim)
+        Q[s, s] = vecs_batched[i]
+        eigs[s] = eigs_batched[i]
+    
+    return Q, eigs
 
 class SOAP(optim.Optimizer):
     """
@@ -62,6 +112,9 @@ class SOAP(optim.Optimizer):
         normalize_grads: bool = False,
         data_format: str = "channels_first",
         correct_bias: bool = True,
+        param_to_name: int = None, 
+        n_heads: int=16,
+        use_k_block_diag: bool = True,
     ):
         defaults = {
             "lr": lr,
@@ -78,6 +131,10 @@ class SOAP(optim.Optimizer):
         }
         super().__init__(params, defaults)
         self._data_format = data_format
+        self.param_to_name = param_to_name or {}
+        self.n_heads = n_heads
+        self._last_eig_time = 0.0
+        self.use_k_block_diag = use_k_block_diag
         
     def merge_dims(self, grad, max_precond_dim):
         """
@@ -140,6 +197,7 @@ class SOAP(optim.Optimizer):
                     state["exp_avg_sq"] = torch.zeros_like(grad)
                 
                 if 'Q' not in state:
+                    param_name = self.param_to_name.get(id(p))
                     self.init_preconditioner(
                         grad,
                         state,
@@ -148,6 +206,8 @@ class SOAP(optim.Optimizer):
                         shampoo_beta=(group['shampoo_beta'] if group['shampoo_beta'] >= 0 else group["betas"][1]),
                         max_precond_dim=group['max_precond_dim'],
                         merge_dims=group["merge_dims"],
+                        param_name=param_name,
+                        n_heads=self.n_heads,
                     )
                     self.update_preconditioner(grad, state,
                                                max_precond_dim=group['max_precond_dim'],
@@ -214,13 +274,25 @@ class SOAP(optim.Optimizer):
         
         return loss
     
+    def _is_head_blocked(self, param_name):
+        if not self.use_k_block_diag:
+            return False
+        if param_name is None:
+            return False
+        return any(p.search(param_name) for p in HEAD_BLOCK_PATTERNS)
+
     def init_preconditioner(self, grad, state, precondition_frequency=10, 
                             shampoo_beta=0.95, max_precond_dim=10000, precondition_1d=False,
-                            merge_dims=False):
+                            merge_dims=False, param_name=None, n_heads=None):
         """
         Initializes the preconditioner matrices (L and R in the paper).
         """
         state['GG'] = [] # Will hold all the preconditioner matrices (L and R in the paper).
+        
+        state['param_name'] = param_name
+        state['is_head_blocked'] = self._is_head_blocked(param_name)
+        state['n_heads'] = n_heads if state['is_head_blocked'] else None  
+         
         if grad.dim() == 1:
             if not precondition_1d or grad.shape[0] > max_precond_dim:
                 state['GG'].append([])
@@ -238,7 +310,8 @@ class SOAP(optim.Optimizer):
                     
         state['Q'] = None # Will hold all the eigenbases of the preconditioner.
         state['precondition_frequency'] = precondition_frequency
-        state['shampoo_beta'] = shampoo_beta          
+        state['shampoo_beta'] = shampoo_beta
+   
         
     def project(self, grad, state, merge_dims=False, max_precond_dim=10000):
         """
@@ -273,6 +346,10 @@ class SOAP(optim.Optimizer):
         """
         Updates the preconditioner matrices and the eigenbases (L, R, Q_L, Q_R in the paper).
         """
+        
+        if state.get('is_head_blocked'):
+            assert not merge_dims, "Head-blocked params not supported with merge_dims=True"
+    
         if state["Q"] is not None:
             state["exp_avg"] = self.project_back(state["exp_avg"], state, merge_dims=merge_dims, max_precond_dim=max_precond_dim)
         if grad.dim() == 1:
@@ -292,22 +369,44 @@ class SOAP(optim.Optimizer):
             else:
                 for idx, sh in enumerate(grad.shape):
                     if sh <= max_precond_dim:
-                        outer_product = torch.tensordot(
-                                grad,
-                                grad,
-                                # Contracts across all dimensions except for k.
-                                dims=[[*chain(range(idx), range(idx + 1, len(grad.shape)))]] * 2,
-                            )
-                        state['GG'][idx].lerp_(outer_product, 1-state['shampoo_beta'])
+                        if state.get('is_head_blocked') and idx == 0:
+                            n_heads = state['n_heads']
+                            head_dim = sh // n_heads
+                            for h in range(n_heads):
+                                g_h = grad[h * head_dim:(h + 1) * head_dim]  # (head_dim, d_in)
+                                # Outer product over the head_dim slice; contracts the d_in axis
+                                outer = torch.tensordot(g_h, g_h, dims=[list(range(1, g_h.dim()))] * 2)
+                                state['GG'][idx][
+                                    h * head_dim:(h + 1) * head_dim,
+                                    h * head_dim:(h + 1) * head_dim
+                                ].lerp_(outer, 1 - state['shampoo_beta'])
+                        else:
+                            outer_product = torch.tensordot(
+                                    grad,
+                                    grad,
+                                    # Contracts across all dimensions except for k.
+                                    dims=[[*chain(range(idx), range(idx + 1, len(grad.shape)))]] * 2,
+                                )
+                            state['GG'][idx].lerp_(outer_product, 1-state['shampoo_beta'])
                      
         if state['Q'] is None:
-            state['Q'] = self.get_orthogonal_matrix(state['GG'])
+            t0 = time.time()
+            state['Q'] = self.get_orthogonal_matrix(state['GG'], state)
+            self._last_eig_time += time.time() - t0
+            
         if state['step'] > 0 and state['step'] % state['precondition_frequency'] == 0:
-            state['Q'] = self.get_orthogonal_matrix_QR(state, max_precond_dim, merge_dims)
-            # state['Q'] = self.get_fast_QR(state, max_precond_dim, merge_dims)             
+            t0 = time.time()
+            #head-blocked uses eigh path; default uses QR
+            if state.get('is_head_blocked'):
+                state['Q'] = self.get_orthogonal_matrix(state['GG'], state)
+            else:
+                state['Q'] = self.get_orthogonal_matrix_QR(state, max_precond_dim, merge_dims)
+                # state['Q'] = self.get_fast_QR(state, max_precond_dim, merge_dims)  
+            self._last_eig_time += time.time() - t0           
 
         if state["step"] > 0:
             state["exp_avg"] = self.project(state["exp_avg"], state, merge_dims=merge_dims, max_precond_dim=max_precond_dim) 
+        
 
     def project_back(self, grad, state, merge_dims=False, max_precond_dim=10000):
         """
@@ -337,7 +436,7 @@ class SOAP(optim.Optimizer):
         return grad
         
 
-    def get_orthogonal_matrix(self, mat):
+    def get_orthogonal_matrix(self, mat, state=None):
         """
         Computes the eigenbases of the preconditioner using torch.linalg.eigh decomposition.
         """
@@ -356,15 +455,21 @@ class SOAP(optim.Optimizer):
                 matrix.append(m.data)
         
         final = []
-        for m in matrix:
+        for i, m in enumerate(matrix):  # enumerate to know which side
             if len(m) == 0:
                 final.append([])
                 continue
-            try:
-                _, Q = torch.linalg.eigh(m+1e-30*torch.eye(m.shape[0], device=m.device))
-            except:
-                _, Q = torch.linalg.eigh(m.to(torch.float64)+1e-30*torch.eye(m.shape[0], device=m.device))
-                Q = Q.to(m.dtype)
+            
+            # head-block for L (idx 0) only
+            if state is not None and state.get('is_head_blocked') and i == 0:
+                Q, _ = blockdiag_eigh(m, state['n_heads'])
+            else:
+                try:
+                    _, Q = torch.linalg.eigh(m+1e-30*torch.eye(m.shape[0], device=m.device))
+                except:
+                    _, Q = torch.linalg.eigh(m.to(torch.float64)+1e-30*torch.eye(m.shape[0], device=m.device))
+                    Q = Q.to(m.dtype)
+                
             Q = torch.flip(Q, [1])
 
             if not float_data:

@@ -31,6 +31,7 @@ from torch.distributed import init_process_group, destroy_process_group
 from model import GPTConfig, GPT
 from torch.utils.tensorboard import SummaryWriter
 from adam_mini import Adam_mini
+from soap import SOAP
 #import ipdb
 
 import logger
@@ -44,6 +45,8 @@ except ImportError:
     _wandb_available = False
 
 import sys
+
+THEORETICAL_PEAK_FLOPS = 154.8e12  # RTX A6000 bf16/fp16 tensor core peak
 
 class Tee:
     """Duplicate output to both stdout/err and file"""
@@ -88,6 +91,7 @@ class Tee:
 # I/O
 out_dir = 'out'
 resume_dir = None
+tee_stdout = False
 eval_interval = 1000
 ckpt_interval = 1000
 log_interval = 1
@@ -129,6 +133,20 @@ seed = 1337
 comment = 'none'
 algorithm = 'adam_mini'
 flash_attn = True
+
+# SOAP defaults
+soap_shampoo_beta = -1           # -1 => use betas[1]
+soap_precondition_frequency = 10
+soap_max_precond_dim = 10000
+soap_merge_dims = False
+soap_precondition_1d = False
+soap_normalize_grads = False
+soap_correct_bias = True
+soap_use_k_block_diag = False
+# preconditioner logging
+log_precond_interval = 0         # 0 = disabled; else save every N steps
+log_precond_dir = ''             # defaults to {save_dir}/precond if empty
+
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
@@ -334,6 +352,24 @@ elif algorithm == 'adam_mini':
     )
     #optimizer.wv_names = {} # For experiments with relatively small total steps  (like the 8B and 13B experiments here, we only run for 10k steps), we apply a single lr for Value and find it performs a bit better. Please comment this line if your total steps is larger than 10k or 20k or more.
 elif algorithm == 'soap':
+    param_to_name = {id(p): n for n, p in model.named_parameters()}
+    optimizer = SOAP(
+        model.parameters(),
+        lr=learning_rate,
+        betas=(beta1, beta2),
+        shampoo_beta=soap_shampoo_beta,
+        eps=epsilon,
+        weight_decay=weight_decay,
+        precondition_frequency=soap_precondition_frequency,
+        max_precond_dim=soap_max_precond_dim,
+        merge_dims=soap_merge_dims,
+        precondition_1d=soap_precondition_1d,
+        normalize_grads=soap_normalize_grads,
+        correct_bias=soap_correct_bias,
+        param_to_name=param_to_name,
+        n_heads=model_args['n_head'],
+        use_k_block_diag=soap_use_k_block_diag,
+    )
     
 else:
     raise ValueError("algorithm not supported")
@@ -437,6 +473,19 @@ def train():
             print(f"saving checkpoint to {out_dir}")
             
             torch.save(checkpoint, os.path.join(out_dir, 'ckpt'+str(iter_num)+'.pt'))
+            
+        if algorithm == 'soap' and master_process and log_precond_interval > 0:
+            should_log_precond = (
+                iter_num % log_precond_interval == 0 or
+                iter_num in extra_save_iters
+            )
+            if should_log_precond:
+                from soap_precond_logger import save_preconditioners
+                save_preconditioners(
+                    optimizer, param_to_name, iter_num,
+                    out_dir=(log_precond_dir or os.path.join(save_dir, 'precond')),
+                    tracked_layers=[0, 6, 12, 18, 23],
+                )
         if iter_num == 0 and eval_only:
             break
 
@@ -484,7 +533,7 @@ def train():
             global_batch = batch_size * gradient_accumulation_steps * ddp_world_size
             samples_per_sec = global_batch / dt
             # Approximate FLOPs/s/GPU: A100 bf16 peak is 312 TFLOPS; running_mfu is vs that.
-            flops_per_sec_per_gpu = running_mfu * 312e12 if running_mfu > 0 else 0.0
+            flops_per_sec_per_gpu = running_mfu * THEORETICAL_PEAK_FLOPS if running_mfu > 0 else 0.0
             peak_mem_gb = torch.cuda.max_memory_allocated() / 1e9
             torch.cuda.reset_peak_memory_stats()
             grad_norm_val = grad_norm.item() if grad_norm is not None else float('nan')
@@ -499,9 +548,9 @@ def train():
             logger_loss_train.append([iter_num, lossf])
             logger_loss_time.append([iter_num, t_f_b_e, t_clip_e, t_step_e])
 
-            # Wandb (Pythia-aligned naming)
+            # Wandb
             if wandb_log:
-                wandb.log({
+                log_dict = {
                     'train/lm_loss':               lossf,
                     'train/learning_rate':         lr,
                     'train/tokens_seen':           tokens_seen,
@@ -511,7 +560,11 @@ def train():
                     'runtime/flops_per_sec_per_gpu': flops_per_sec_per_gpu,
                     'perf/mfu':                    running_mfu,
                     'mem/peak_gpu_gb':             peak_mem_gb,
-                }, step=iter_num)
+                } 
+                if hasattr(optimizer, '_last_eig_time'):
+                    log_dict['runtime/eig_time_per_step'] = optimizer._last_eig_time / log_interval
+                    optimizer._last_eig_time = 0.0
+                wandb.log(log_dict, step=iter_num)
             
             
         iter_num += 1
