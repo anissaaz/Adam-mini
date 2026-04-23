@@ -16,6 +16,8 @@ from itertools import chain
 # Parameter-name patterns that get block-diagonal L preconditioner.
 # Add 'attn.wq' later to extend, 'mlp.c_fc|mlp.c_proj' for MLPs (needs different block size).
 HEAD_BLOCK_PATTERNS = [re.compile(r'attn\.wk')]
+LOW_RANK_PATTERNS = [(re.compile(r'mlp\.c_fc\.weight'), 1, 16)]  # (pattern, side_idx, rank)
+
 
 def blockdiag_eigh(L, n_heads):
     """Eigendecompose a block-diagonal matrix by extracting per-head blocks and processing them as a batched eigh.
@@ -59,6 +61,52 @@ def blockdiag_eigh(L, n_heads):
         Q[s, s] = vecs_batched[i]
         eigs[s] = eigs_batched[i]
     
+    return Q, eigs
+
+def get_low_rank_config(param_name, patterns=LOW_RANK_PATTERNS):
+    """Returns (side, rank) if param matches a low-rank pattern, else None."""
+    if param_name is None:
+        return None
+    for pat, side, rank in patterns:
+        if pat.search(param_name):
+            return (side, rank)
+    return None
+
+def truncated_eigh(L, k):
+    """Top-k eigendecomposition of symmetric PSD L via full eigh + truncation.
+    Returns (Q_k, eigs_k) where Q_k is (d, k), eigs_k is (k,) descending.
+    
+    lobpcg is intentionally avoided: on matrices where k is not tiny relative
+    to d (here k=64, d=4096, ratio=1.6%), lobpcg frequently fails to converge
+    within its iteration budget and returns finite-but-wrong eigenvectors.
+    Full eigh is faster in practice and always returns correct eigenvectors.
+    """
+    L = 0.5 * (L + L.T)
+    d = L.shape[0]
+    # if not torch.isfinite(L).all():
+    #     L = torch.nan_to_num(L, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    ridge = L.diag().abs().mean().clamp(min=1e-2) * 1e-6 + 1e-8  # stays on GPU
+    eye = torch.eye(d, device=L.device, dtype=L.dtype)
+    eigs_full, Q_full = torch.linalg.eigh(L + ridge * eye)
+    # try:
+    #     eigs_full, Q_full = torch.linalg.eigh(L + ridge * eye)
+    #     # if not torch.isfinite(Q_full).all() or not torch.isfinite(eigs_full).all():
+    #     #     raise RuntimeError("eigh fp32 silent NaN")
+    # except Exception:
+    #     L64 = L.to(torch.float64)
+    #     mean64 = L64.diag().abs().mean().item()
+    #     ridge64 = max(1e-4 * mean64, 1e-12)
+    #     eye64 = torch.eye(d, device=L.device, dtype=torch.float64)
+    #     eigs_full, Q_full = torch.linalg.eigh(L64 + ridge64 * eye64)
+    #     if not torch.isfinite(Q_full).all():
+    #         Q_full = torch.eye(d, dtype=torch.float64, device=L.device)
+    #         eigs_full = torch.ones(d, dtype=torch.float64, device=L.device)
+    #     eigs_full = eigs_full.to(L.dtype)
+    #     Q_full = Q_full.to(L.dtype)
+
+    eigs = torch.flip(eigs_full, [0])[:k]
+    Q = torch.flip(Q_full, [1])[:, :k]
     return Q, eigs
 
 class SOAP(optim.Optimizer):
@@ -114,7 +162,8 @@ class SOAP(optim.Optimizer):
         correct_bias: bool = True,
         param_to_name: int = None, 
         n_heads: int=16,
-        use_k_block_diag: bool = True,
+        use_k_block_diag: bool = False,
+        use_low_rank: bool = False,
     ):
         defaults = {
             "lr": lr,
@@ -135,6 +184,8 @@ class SOAP(optim.Optimizer):
         self.n_heads = n_heads
         self._last_eig_time = 0.0
         self.use_k_block_diag = use_k_block_diag
+        self.use_low_rank = use_low_rank
+        self._eigh_fp32_failures = 0
         
     def merge_dims(self, grad, max_precond_dim):
         """
@@ -188,13 +239,6 @@ class SOAP(optim.Optimizer):
                 
                 if "step" not in state:
                     state["step"] = 0 
-                    
-                # State initialization
-                if "exp_avg" not in state:
-                    # Exponential moving average of gradient values
-                    state["exp_avg"] = torch.zeros_like(grad)
-                    # Exponential moving average of squared gradient values
-                    state["exp_avg_sq"] = torch.zeros_like(grad)
                 
                 if 'Q' not in state:
                     param_name = self.param_to_name.get(id(p))
@@ -209,12 +253,28 @@ class SOAP(optim.Optimizer):
                         param_name=param_name,
                         n_heads=self.n_heads,
                     )
+                    
+                    proj_shape = list(grad.shape)
+                    if state.get('low_rank_side') is not None:
+                        proj_shape[state['low_rank_side']] = state['low_rank_k']
+                    state["exp_avg"] = torch.zeros(proj_shape, dtype=grad.dtype, device=grad.device)
+                    state["exp_avg_sq"] = torch.zeros(proj_shape, dtype=grad.dtype, device=grad.device)
+                    
+                    
                     self.update_preconditioner(grad, state,
                                                max_precond_dim=group['max_precond_dim'],
                                                merge_dims=group["merge_dims"],
                                                precondition_1d=group["precondition_1d"])
-                    continue # first step is skipped so that we never use the current gradients in the projection.
+                    continue # first step is skipped so that we never use the current gradients in the projection.  
+                  
+                # State initialization
+                # if "exp_avg" not in state:
+                #     # Exponential moving average of gradient values
+                #     state["exp_avg"] = torch.zeros_like(grad)
+                #     # Exponential moving average of squared gradient values
+                #     state["exp_avg_sq"] = torch.zeros_like(grad)
                 
+
                 # Projecting gradients to the eigenbases of Shampoo's preconditioner 
                 # i.e. projecting to the eigenbases of matrices in state['GG']
                 grad_projected = self.project(grad, state, merge_dims=group["merge_dims"], 
@@ -292,6 +352,11 @@ class SOAP(optim.Optimizer):
         state['param_name'] = param_name
         state['is_head_blocked'] = self._is_head_blocked(param_name)
         state['n_heads'] = n_heads if state['is_head_blocked'] else None  
+        
+        # low-rank config
+        lr_config = get_low_rank_config(param_name) if self.use_low_rank else None
+        state['low_rank_side'] = lr_config[0] if lr_config else None
+        state['low_rank_k'] = lr_config[1] if lr_config else None
          
         if grad.dim() == 1:
             if not precondition_1d or grad.shape[0] > max_precond_dim:
@@ -346,9 +411,12 @@ class SOAP(optim.Optimizer):
         """
         Updates the preconditioner matrices and the eigenbases (L, R, Q_L, Q_R in the paper).
         """
+        grad = grad.float() if grad.dtype != torch.float32 else grad
         
         if state.get('is_head_blocked'):
             assert not merge_dims, "Head-blocked params not supported with merge_dims=True"
+        if state.get('low_rank_side') is not None:
+            assert not merge_dims, "Low-rank params not supported with merge_dims=True"
     
         if state["Q"] is not None:
             state["exp_avg"] = self.project_back(state["exp_avg"], state, merge_dims=merge_dims, max_precond_dim=max_precond_dim)
@@ -393,19 +461,25 @@ class SOAP(optim.Optimizer):
             t0 = time.time()
             state['Q'] = self.get_orthogonal_matrix(state['GG'], state)
             self._last_eig_time += time.time() - t0
-            
-        if state['step'] > 0 and state['step'] % state['precondition_frequency'] == 0:
+        
+        # Lazy refresh only applies to the expensive truncated-eigh call
+        effective_freq = state['precondition_frequency']
+        if state.get('low_rank_side') is not None:
+            effective_freq *= 4  # 1024x1024 full eigh every 40 steps instead of 10
+        
+        if state['step'] > 0 and state['step'] % effective_freq == 0:
             t0 = time.time()
-            #head-blocked uses eigh path; default uses QR
-            if state.get('is_head_blocked'):
-                state['Q'] = self.get_orthogonal_matrix(state['GG'], state)
-            else:
-                state['Q'] = self.get_orthogonal_matrix_QR(state, max_precond_dim, merge_dims)
-                # state['Q'] = self.get_fast_QR(state, max_precond_dim, merge_dims)  
-            self._last_eig_time += time.time() - t0           
+            state['Q'] = self.get_orthogonal_matrix_QR(state, max_precond_dim, merge_dims)
+            self._last_eig_time += time.time() - t0      
 
         if state["step"] > 0:
             state["exp_avg"] = self.project(state["exp_avg"], state, merge_dims=merge_dims, max_precond_dim=max_precond_dim) 
+        
+        if state.get('low_rank_side') is not None and state['step'] < 2:
+            side = state['low_rank_side']
+            print(f"[DEBUG] {state['param_name']} low-rank: "
+                f"GG[{side}].shape={state['GG'][side].shape}, "
+                f"Q[{side}].shape={state['Q'][side].shape}")
         
 
     def project_back(self, grad, state, merge_dims=False, max_precond_dim=10000):
@@ -437,45 +511,85 @@ class SOAP(optim.Optimizer):
         
 
     def get_orthogonal_matrix(self, mat, state=None):
-        """
-        Computes the eigenbases of the preconditioner using torch.linalg.eigh decomposition.
-        """
-        matrix = []
-        for m in mat:
-            if len(m) == 0:
-                matrix.append([])
-                continue
-            if m.data.dtype != torch.float:
-                float_data = False
-                original_type = m.data.dtype
-                original_device = m.data.device
-                matrix.append(m.data.float())
-            else:
-                float_data = True
-                matrix.append(m.data)
-        
-        final = []
-        for i, m in enumerate(matrix):  # enumerate to know which side
-            if len(m) == 0:
-                final.append([])
-                continue
-            
-            # head-block for L (idx 0) only
-            if state is not None and state.get('is_head_blocked') and i == 0:
-                Q, _ = blockdiag_eigh(m, state['n_heads'])
-            else:
-                try:
-                    _, Q = torch.linalg.eigh(m+1e-30*torch.eye(m.shape[0], device=m.device))
-                except:
-                    _, Q = torch.linalg.eigh(m.to(torch.float64)+1e-30*torch.eye(m.shape[0], device=m.device))
-                    Q = Q.to(m.dtype)
-                
-            Q = torch.flip(Q, [1])
+            matrix = []
+            for m in mat:
+                if len(m) == 0:
+                    matrix.append([])
+                    continue
+                if m.data.dtype != torch.float:
+                    float_data = False
+                    original_type = m.data.dtype
+                    original_device = m.data.device
+                    matrix.append(m.data.float())
+                else:
+                    float_data = True
+                    matrix.append(m.data)
 
-            if not float_data:
-                Q = Q.to(original_device).type(original_type)
-            final.append(Q)
-        return final
+            final = []
+            for i, m in enumerate(matrix):
+                if len(m) == 0:
+                    final.append([])
+                    continue
+
+                if state is not None and state.get('is_head_blocked') and i == 0:
+                    Q, _ = blockdiag_eigh(m, state['n_heads'])
+                    Q = torch.flip(Q, [1])
+
+                elif state is not None and state.get('low_rank_side') == i:
+                    Q, _ = truncated_eigh(m, state['low_rank_k'])
+
+                else:
+                    m_sym = 0.5 * (m + m.T)
+
+                    # for debugging:
+                    # has_nan = torch.isnan(m_sym).any().item()
+                    # has_inf = torch.isinf(m_sym).any().item()
+                    # diag_min = m_sym.diag().min().item()
+                    # diag_max = m_sym.diag().max().item()
+                    # fro_norm = m_sym.norm().item()
+
+                    # if has_nan or has_inf:
+                    #     param_name = state.get('param_name', '?') if state else '?'
+                    #     step = state.get('step', '?') if state else '?'
+                    #     print(f"[CRITICAL] Non-finite GG for {param_name} step {step}: "
+                    #         f"nan={has_nan} inf={has_inf}")
+                    #     torch.save(m, f'/tmp/failed_GG_{param_name.replace(".", "_")}_step{step}.pt')
+
+                    # if not torch.isfinite(m_sym).all():
+                    #     m_sym = torch.nan_to_num(m_sym, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+                    ridge = m_sym.diag().abs().mean().clamp(min=1e-2) * 1e-6 + 1e-8  # stays on GPU
+                    eye = torch.eye(m.shape[0], device=m.device)
+                    
+                    try:
+                        _, Q = torch.linalg.eigh(m_sym + ridge * eye)
+                        # cuSOLVER can silently return NaN without raising — check explicitly
+                        # if not torch.isfinite(Q).all():
+                        #     raise RuntimeError("eigh fp32 silent NaN")
+                    except (torch._C._LinAlgError, RuntimeError) as e:
+                        param_name = state.get('param_name', '?') if state else '?'
+                        step = state.get('step', '?') if state else '?'
+                        print(f"[WARN] eigh fallback to fp64 for {param_name} step {step}: {e}")
+                        # print(f"  matrix stats: norm={fro_norm:.3e}, diag_min={diag_min:.3e}, "
+                        #     f"diag_max={diag_max:.3e}, mean_eig={mean_eig:.3e}, ridge={ridge:.3e}")
+                        # torch.save(m, f'/tmp/failed_eigh_{param_name.replace(".", "_")}_step{step}.pt')
+                        m64 = m_sym.to(torch.float64)
+                        ridge64 = 1e-4 * (m64.diag().abs().mean().item() + 1e-30)
+                        eye64 = torch.eye(m.shape[0], device=m.device, dtype=torch.float64)
+                        _, Q = torch.linalg.eigh(m64 + ridge64 * eye64)
+                        if not torch.isfinite(Q).all():
+                            print(f"[CRITICAL] fp64 eigh also failed for {param_name}, using identity")
+                            Q = torch.eye(m.shape[0], device=m.device, dtype=torch.float64)
+                        Q = Q.to(m.dtype)
+                        self._eigh_fp32_failures += 1
+
+                    Q = torch.flip(Q, [1])
+
+                if not float_data:
+                    Q = Q.to(original_device).type(original_type)
+                final.append(Q)
+            return final
         
 
     def get_orthogonal_matrix_QR(self, state, max_precond_dim=10000, merge_dims=False):
@@ -485,6 +599,8 @@ class SOAP(optim.Optimizer):
         """
         precond_list = state['GG']
         orth_list = state['Q']
+        is_head_blocked = state.get('is_head_blocked')
+        low_rank_side = state.get('low_rank_side')
 
         matrix = []
         orth_matrix = []
@@ -513,10 +629,31 @@ class SOAP(optim.Optimizer):
             exp_avg_sq = state['exp_avg_sq']
             
         final = []
+        effective_freq = state['precondition_frequency']
         for ind, (m,o) in enumerate(zip(matrix, orth_matrix)):
             if len(m)==0:
                 final.append([])
                 continue
+            
+            # Low-rank side: re-run truncated eigh (can't do QR on a (d,k) basis cleanly)
+            # but only this one dimension; the other side still gets cheap QR
+            if low_rank_side is not None and ind == low_rank_side:
+                if state['step'] % (effective_freq * 10) == 0:
+                    Q, _ = truncated_eigh(m, state['low_rank_k'])
+                else:
+                    # Cheap: one power iteration step on the existing k-column basis
+                    power_iter = m @ o  # o is (d, k)
+                    Q, _ = torch.linalg.qr(power_iter)
+                final.append(Q)
+                continue
+            
+            # Head-blocked side: must use blockdiag_eigh
+            if is_head_blocked and ind == 0:
+                Q, _ = blockdiag_eigh(m, state['n_heads'])
+                Q = torch.flip(Q, [1])
+                final.append(Q)
+                continue
+            
             est_eig = torch.diag(o.T @ m @ o)
             sort_idx = torch.argsort(est_eig, descending=True)
             exp_avg_sq = exp_avg_sq.index_select(ind, sort_idx)

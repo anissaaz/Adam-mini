@@ -143,6 +143,7 @@ soap_precondition_1d = False
 soap_normalize_grads = False
 soap_correct_bias = True
 soap_use_k_block_diag = False
+soap_use_low_rank = False
 # preconditioner logging
 log_precond_interval = 0         # 0 = disabled; else save every N steps
 log_precond_dir = ''             # defaults to {save_dir}/precond if empty
@@ -369,6 +370,7 @@ elif algorithm == 'soap':
         param_to_name=param_to_name,
         n_heads=model_args['n_head'],
         use_k_block_diag=soap_use_k_block_diag,
+        use_low_rank=soap_use_low_rank,
     )
     
 else:
@@ -564,6 +566,11 @@ def train():
                 if hasattr(optimizer, '_last_eig_time'):
                     log_dict['runtime/eig_time_per_step'] = optimizer._last_eig_time / log_interval
                     optimizer._last_eig_time = 0.0
+                
+                if hasattr(optimizer, '_eigh_fp32_failures'):
+                    log_dict['runtime/eigh_fp32_failures'] = optimizer._eigh_fp32_failures
+                    optimizer._eigh_fp32_failures = 0
+                    
                 wandb.log(log_dict, step=iter_num)
             
             
