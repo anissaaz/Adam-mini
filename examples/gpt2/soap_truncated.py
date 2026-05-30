@@ -65,6 +65,84 @@ def get_low_rank_config(param_name, patterns):
             return rank_map
     return None
 
+_warned_nonfinite = set()
+def _robust_eigh(mat):
+    """
+    Numerically stable symmetric eigendecomposition for gradient covariance matrices.
+ 
+    Handles the failure modes common in LLM training:
+      - NaN/Inf from loss spikes (AMP grad scaler should catch these, but just in case)
+      - Ill-conditioned / near-singular matrices (many repeated small eigenvalues)
+      - float32 LAPACK failures that float64 can recover from
+ 
+    Strategy (in order):
+      1. NaN/Inf guard — return identity rather than crash.
+      2. Force symmetry (numerical drift from fp ops can break it).
+      3. fp32 with small jitter (1e-6 * trace/d).
+      4. fp64 with the same small jitter.
+      5. fp64 with aggressive jitter (1e-2 * trace/d, min 1e-6).
+      6. Absolute fallback: identity eigenvectors, uniform eigenvalues.
+ 
+    Note: `reg` is always a plain Python float here (scalar derived from .item()
+    or direct arithmetic), never a Tensor, so no .to() is needed on it.
+ 
+    Args:
+        mat: (d, d) symmetric tensor, any float dtype, any device.
+ 
+    Returns:
+        eigs: (d,) eigenvalues ascending (matches torch.linalg.eigh convention).
+        vecs: (d, d) corresponding eigenvectors as columns.
+    """
+    d = mat.shape[0]
+    device, dtype = mat.device, mat.dtype
+ 
+    # NaN / Inf guard
+    if not torch.isfinite(mat).all():
+        key = (d, dtype)
+        if key not in _warned_nonfinite:
+            _warned_nonfinite.add(key)
+            print(f"[WARN] _robust_eigh: non-finite {mat.shape} matrix — "
+                  f"upstream gradient overflow. Check grad_norm_clip and AMP settings.")
+        return (
+            torch.ones(d, device=device, dtype=dtype),
+            torch.eye(d, device=device, dtype=dtype),
+        )
+ 
+    # Force symmetry — fp accumulation can make A @ A.T slightly asymmetric
+    mat = 0.5 * (mat + mat.T)
+    trace = mat.diagonal().sum().clamp(min=1e-12)
+    eye = torch.eye(d, device=device, dtype=dtype)
+ 
+    # fp32 + small jitter
+    reg_small = (1e-6 * trace) / d
+    try:
+        return torch.linalg.eigh(mat + reg_small * eye)
+    except torch.linalg.LinAlgError:
+        pass
+ 
+    # fp64 + small jitter
+    mat64 = mat.to(torch.float64)
+    eye64 = torch.eye(d, device=device, dtype=torch.float64)
+    try:
+        eigs, vecs = torch.linalg.eigh(mat64 + reg_small * eye64)
+        return eigs.to(dtype), vecs.to(dtype)
+    except torch.linalg.LinAlgError:
+        pass
+ 
+    # fp64 + aggressive jitter
+    reg_big = max(1e-2 * trace / d, 1e-6)
+    try:
+        eigs, vecs = torch.linalg.eigh(mat64 + reg_big * eye64)
+        return eigs.to(dtype), vecs.to(dtype)
+    except torch.linalg.LinAlgError:
+        pass
+ 
+    # fallback – identity basis, uniform spectrum
+    return (
+        torch.ones(d, device=device, dtype=dtype),
+        torch.eye(d, device=device, dtype=dtype),
+    )
+
 
 def streaming_lowrank_update(F_old, G_side, beta2, k, eps=1e-30):
     """
@@ -89,6 +167,11 @@ def streaming_lowrank_update(F_old, G_side, beta2, k, eps=1e-30):
     """
     sqrt_b2 = math.sqrt(beta2)
     sqrt_1mb2 = math.sqrt(1.0 - beta2)
+    
+    # Force float32 to prevent bfloat16 overflow
+    G_side = G_side.float()
+    if isinstance(F_old, torch.Tensor) and F_old.numel() > 0:
+        F_old = F_old.float()
 
     # Build A so that A @ A.T = beta2 * F_old F_old^T + (1-beta2) G_side G_side^T
     if F_old is None or F_old.numel() == 0:
@@ -104,13 +187,8 @@ def streaming_lowrank_update(F_old, G_side, beta2, k, eps=1e-30):
     if n_cols <= k:
         # Compute eigenvectors via small Gram on A^T A (n_cols × n_cols)
         AtA = A.T @ A
-        AtA = 0.5 * (AtA + AtA.T)
-        trace = AtA.diagonal().sum().clamp(min=1e-12)
-        reg = (1e-6 * trace) / AtA.shape[0]
-        eye_q = torch.eye(n_cols, device=device, dtype=dtype)
-        AtA = AtA + reg * eye_q
+        eigs_small, V_small = _robust_eigh(AtA)
         
-        eigs_small, V_small = torch.linalg.eigh(AtA)
         # Descending order; pad to k with zero eigenvalues / zero columns
         eigs_small = torch.flip(eigs_small, [0]).clamp(min=0)
         V_small = torch.flip(V_small, [1])
@@ -129,13 +207,8 @@ def streaming_lowrank_update(F_old, G_side, beta2, k, eps=1e-30):
     if d <= n_cols:
         # eigendecompose A A^T (d × d) — gets U directly, columns of U are eigenvectors
         AAt = A @ A.T
-        AAt = 0.5 * (AAt + AAt.T)
-        trace = AAt.diagonal().sum().clamp(min=1e-12)
-        reg = (1e-6 * trace) / AAt.shape[0]
-        eye_d = torch.eye(d, device=device, dtype=dtype)
-        AAt = AAt + reg * eye_d
+        eigs_full, U_full = _robust_eigh(AAt)
         
-        eigs_full, U_full = torch.linalg.eigh(AAt)
         eigs = torch.flip(eigs_full, [0])[:k].clamp(min=0)
         U = torch.flip(U_full, [1])[:, :k]
         Q = U
@@ -143,13 +216,8 @@ def streaming_lowrank_update(F_old, G_side, beta2, k, eps=1e-30):
     else:
         # eigendecompose A^T A ((k+q) × (k+q)) — get V then F_new = A V
         AtA = A.T @ A
-        AtA = 0.5 * (AtA + AtA.T)
-        trace = AtA.diagonal().sum().clamp(min=1e-12)
-        reg = (1e-6 * trace) / AtA.shape[0]
-        eye_q = torch.eye(n_cols, device=device, dtype=dtype)
-        AtA = AtA + reg * eye_q
-        
-        eigs_full, V_full = torch.linalg.eigh(AtA)
+        eigs_full, V_full = _robust_eigh(AtA)
+
         eigs = torch.flip(eigs_full, [0])[:k].clamp(min=0)
         V = torch.flip(V_full, [1])[:, :k]
         F_new = A @ V  # (d, k); column i has norm sqrt(eig_i)

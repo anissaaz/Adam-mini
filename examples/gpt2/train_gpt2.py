@@ -17,6 +17,7 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 """
 import argparse
 import os
+import re
 import time
 import math
 import pickle
@@ -32,6 +33,9 @@ from model import GPTConfig, GPT
 from torch.utils.tensorboard import SummaryWriter
 from adam_mini import Adam_mini
 from soap import SOAP
+from soap_exp_avg_trunc import SOAPExpAvgTrunc
+from soap_truncated import SOAPTruncated
+from soap_precond_logger import save_preconditioners_truncated
 #import ipdb
 
 import logger
@@ -147,6 +151,12 @@ soap_use_low_rank = False
 # preconditioner logging
 log_precond_interval = 0         # 0 = disabled; else save every N steps
 log_precond_dir = ''             # defaults to {save_dir}/precond if empty
+
+# SOAP truncated
+soap_use_streaming_lowrank = False
+soap_streaming_q_freq = 1
+soap_mini_mode = 'none'   # options: 'none', 'scalar', 'per_row', 'per_col'
+soap_mini_apply = 'all'   # options: 'all', 'low_rank', 'mlp', 'none'
 
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
@@ -367,10 +377,69 @@ elif algorithm == 'soap':
         precondition_1d=soap_precondition_1d,
         normalize_grads=soap_normalize_grads,
         correct_bias=soap_correct_bias,
+    )
+elif algorithm == 'soap_exp_avg_trunc':
+    param_to_name = {id(p): n for n, p in model.named_parameters()}
+    optimizer = SOAPExpAvgTrunc(
+        model.parameters(),
+        lr=learning_rate,
+        betas=(beta1, beta2),
+        shampoo_beta=soap_shampoo_beta,
+        eps=epsilon,
+        weight_decay=weight_decay,
+        precondition_frequency=soap_precondition_frequency,
+        max_precond_dim=soap_max_precond_dim,
+        merge_dims=soap_merge_dims,
+        precondition_1d=soap_precondition_1d,
+        normalize_grads=soap_normalize_grads,
+        correct_bias=soap_correct_bias,
         param_to_name=param_to_name,
         n_heads=model_args['n_head'],
         use_k_block_diag=soap_use_k_block_diag,
         use_low_rank=soap_use_low_rank,
+    )
+elif algorithm == 'soap_truncated':
+    param_to_name = {id(p): n for n, p in model.named_parameters()}
+    
+    low_rank_patterns = [
+        (re.compile(r'attn\.wq\.weight'),    {0: 256, 1: 128}),
+        (re.compile(r'attn\.wk\.weight'),    {0: 256, 1: 128}),
+        (re.compile(r'attn\.wv\.weight'),    {0: 256, 1: 128}),
+        
+        (re.compile(r'mlp\.c_fc\.weight'),   {0: 512, 1: 128}),
+        (re.compile(r'mlp\.c_proj\.weight'), {0: 128, 1: 128}),
+    ]
+    # low_rank_patterns = [
+    #     # (re.compile(r'attn\.wq\.weight'),    {0: 256, 1: 128}),
+    #     # (re.compile(r'attn\.wk\.weight'),    {0: 256, 1: 128}),
+    #     # (re.compile(r'attn\.wv\.weight'),    {0: 256, 1: 128}),
+        
+    #     # (re.compile(r'mlp\.c_fc\.weight'),   {0: 16, 1: 32}),
+    #     # (re.compile(r'mlp\.c_proj\.weight'), {0: 16, 1: 32}),
+    # ]
+
+    optimizer = SOAPTruncated(
+        model.parameters(),
+        lr=learning_rate,
+        betas=(beta1, beta2),
+        shampoo_beta=soap_shampoo_beta,
+        eps=epsilon,
+        weight_decay=weight_decay,
+        precondition_frequency=soap_precondition_frequency,
+        max_precond_dim=soap_max_precond_dim,
+        merge_dims=soap_merge_dims,
+        precondition_1d=soap_precondition_1d,
+        normalize_grads=soap_normalize_grads,
+        correct_bias=soap_correct_bias,
+        param_to_name=param_to_name,
+        n_heads=model_args['n_head'],
+        # ---- New Truncated Options ----
+        use_streaming_lowrank=soap_use_streaming_lowrank,
+        streaming_q_freq=soap_streaming_q_freq,
+        low_rank_patterns=low_rank_patterns,
+        soap_mini_mode=soap_mini_mode,
+        soap_mini_apply=soap_mini_apply,
+        use_k_block_diag=soap_use_k_block_diag,
     )
     
 else:
@@ -486,8 +555,20 @@ def train():
                 save_preconditioners(
                     optimizer, param_to_name, iter_num,
                     out_dir=(log_precond_dir or os.path.join(save_dir, 'precond')),
-                    tracked_layers=[0, 6, 12, 18, 23],
+                    tracked_layers=[0, 8, 17, 26, 35],
                 )
+        if algorithm == 'soap_truncated' and master_process and log_precond_interval > 0:
+            should_log_precond = (
+                iter_num % log_precond_interval == 0 or
+                iter_num in extra_save_iters
+            )
+            if should_log_precond:
+                save_preconditioners_truncated(
+                    optimizer, param_to_name, iter_num,
+                    out_dir=(log_precond_dir or os.path.join(save_dir, 'precond')),
+                    tracked_layers=[0, 8, 17, 26, 35],
+                )
+        
         if iter_num == 0 and eval_only:
             break
 
